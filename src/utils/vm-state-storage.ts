@@ -4,7 +4,8 @@
  * Windows 11 (and other Windows templates with a persistent TPM or EFI) get a tiny
  * "persistent-state-for-<vm>" PVC, about 10 MiB, always in Filesystem mode. KubeVirt
  * picks its class like this (KubeVirt 1.8, OpenShift Virtualization 4.22):
- *   1. HyperConverged spec.storage.vmStateStorageClass (KubeVirt vmStateStorageClass),
+ *   1. HyperConverged vmStateStorageClass (v1beta1 spec.vmStateStorageClass, v1
+ *      spec.storage.vmStateStorageClass; KubeVirt configuration.vmStateStorageClass),
  *   2. else the default virtualization class (storageclass.kubevirt.io/is-default-virt-class),
  *   3. else the default class (storageclass.kubernetes.io/is-default-class).
  * XFS cannot be formatted that small (minimum 300 MB), so on an XFS class the VM never
@@ -144,7 +145,8 @@ export function evaluateVmStateStorage(
 }
 
 export function vmStateStorageCommand(hcoNamespace: string, hcoName: string, className: string): string {
-  return `oc patch hyperconverged ${hcoName} -n ${hcoNamespace} --type merge -p '{"spec":{"storage":{"vmStateStorageClass":"${className}"}}}'`;
+  // Explicit v1beta1, like the plugin (in v1 the field is spec.storage.vmStateStorageClass).
+  return `oc patch hyperconverged.v1beta1.hco.kubevirt.io ${hcoName} -n ${hcoNamespace} --type merge -p '{"spec":{"vmStateStorageClass":"${className}"}}'`;
 }
 
 export function minPvcSizeCommand(className: string): string {

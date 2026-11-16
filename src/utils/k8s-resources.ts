@@ -78,8 +78,13 @@ export const StorageProfileModel: K8sModel = {
   namespaced: false,
 };
 
+/**
+ * HyperConverged as served by hco.kubevirt.io/v1beta1 (the storage version, served on every
+ * supported release). There the VM state class is spec.vmStateStorageClass; v1 moved it to
+ * spec.storage.vmStateStorageClass. Read and patch through v1beta1 only.
+ */
 export type HyperConvergedKind = K8sResourceCommon & {
-  spec?: { storage?: { vmStateStorageClass?: string } };
+  spec?: { vmStateStorageClass?: string };
 };
 
 /** CNV golden-image namespace — product identity, not a lab name. */

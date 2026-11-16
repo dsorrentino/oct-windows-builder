@@ -36,7 +36,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
   const hco = (hcos || [])[0];
   const ns = hco?.metadata?.namespace || 'openshift-cnv';
   const result = useMemo(
-    () => evaluateVmStateStorage(hco?.spec?.storage?.vmStateStorageClass, storageClasses, profiles || []),
+    () => evaluateVmStateStorage(hco?.spec?.vmStateStorageClass, storageClasses, profiles || []),
     [hco, storageClasses, profiles],
   );
   const [canPatchHco] = useAccessReview({
@@ -54,7 +54,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
   });
 
   const recovery = t(
-    'A VM that is already stuck: stop it, delete its persistent-state-for-<vm> PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM\'s TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.',
+    'A VM that is already stuck: stop it, delete its persistent-state-for-<vm>-xxxxx PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM\'s TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.',
   );
 
   if (applied) {
@@ -64,10 +64,20 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  // Users who can't read the HyperConverged resource, clusters without it, or nothing wrong: stay quiet.
-  if (!storageClassesLoaded || !spLoaded || !hcoLoaded || hcoErr || !hco?.metadata?.name || !result.broken) {
-    return null;
+  if (!storageClassesLoaded || !spLoaded || !hcoLoaded) return null;
+  // Can't read the HyperConverged resource: judge from the default classes the user can see,
+  // with a softer note (an admin may have set another VM state class) and no buttons.
+  if (hcoErr || !hco?.metadata?.name) {
+    if (!hcoErr) return null; // no OpenShift Virtualization: nothing to check
+    const guess = evaluateVmStateStorage(undefined, storageClasses, profiles || []);
+    if (!guess.broken) return null;
+    return (
+      <Alert variant="info" isInline title={t('Windows 11 VMs may not start: the default VM state class {{sc}} uses XFS', { sc: guess.className })}>
+        {t('Unless a cluster admin set another VM state class in OpenShift Virtualization, VMs with a persistent TPM or EFI (Windows 11) will stay in Scheduling. Ask a cluster admin to check the HyperConverged vmStateStorageClass setting.')}
+      </Alert>
+    );
   }
+  if (!result.broken) return null;
 
   const sc = result.className;
   const fix = result.suggestion;
@@ -79,9 +89,8 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
         await k8sPatch({
           model: HyperConvergedModel,
           resource: hco,
-          data: hco.spec?.storage
-            ? [{ op: 'add', path: '/spec/storage/vmStateStorageClass', value: fix }]
-            : [{ op: 'add', path: '/spec/storage', value: { vmStateStorageClass: fix } }],
+          // v1beta1 field (see HyperConvergedKind).
+          data: [{ op: 'add', path: '/spec/vmStateStorageClass', value: fix }],
         });
         setApplied(t('VM state now uses {{sc}}. New Windows VMs can start.', { sc: fix }));
       } else {
@@ -106,7 +115,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
 
   const where =
     result.source === 'hyperconverged'
-      ? t('the HyperConverged setting spec.storage.vmStateStorageClass')
+      ? t('the HyperConverged vmStateStorageClass setting')
       : result.source === 'default-virt'
         ? t('the default virtualization StorageClass')
         : t('the default StorageClass');

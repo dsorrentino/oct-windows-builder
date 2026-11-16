@@ -98,10 +98,8 @@
   "Use {{fix}} for VM state": "Use {{fix}} for VM state",
   "Copy": "Copy",
   "Copied": "Copied",
-  "A VM that is already stuck: stop it, delete its persistent-state-for-<vm> PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM's TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.": "A VM that is already stuck: stop it, delete its persistent-state-for-<vm> PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM's TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.",
   "StorageProfile {{sc}} not found.": "StorageProfile {{sc}} not found.",
   "{{sc}} now creates volumes of at least {{size}}. New Windows VMs can start.": "{{sc}} now creates volumes of at least {{size}}. New Windows VMs can start.",
-  "the HyperConverged setting spec.storage.vmStateStorageClass": "the HyperConverged setting spec.storage.vmStateStorageClass",
   "the default virtualization StorageClass": "the default virtualization StorageClass",
   "the default StorageClass": "the default StorageClass",
   "OpenShift Virtualization stores each VM's TPM and EFI state on {{sc}} ({{where}}).": "OpenShift Virtualization stores each VM's TPM and EFI state on {{sc}} ({{where}}).",
@@ -114,5 +112,9 @@
   "(StorageProfile annotation; each VM state volume then uses {{size}})": "(StorageProfile annotation; each VM state volume then uses {{size}})",
   "Set the minimum size": "Set the minimum size",
   "Ask a cluster admin to run one of these commands.": "Ask a cluster admin to run one of these commands.",
-  "Could not apply the fix": "Could not apply the fix"
+  "Could not apply the fix": "Could not apply the fix",
+  "A VM that is already stuck: stop it, delete its persistent-state-for-<vm>-xxxxx PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM's TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.": "A VM that is already stuck: stop it, delete its persistent-state-for-<vm>-xxxxx PVC and start it again. Only do this for a VM that never booted: the state volume holds the VM's TPM (BitLocker keys) and EFI variables, and deleting it on a used VM loses them.",
+  "Windows 11 VMs may not start: the default VM state class {{sc}} uses XFS": "Windows 11 VMs may not start: the default VM state class {{sc}} uses XFS",
+  "Unless a cluster admin set another VM state class in OpenShift Virtualization, VMs with a persistent TPM or EFI (Windows 11) will stay in Scheduling. Ask a cluster admin to check the HyperConverged vmStateStorageClass setting.": "Unless a cluster admin set another VM state class in OpenShift Virtualization, VMs with a persistent TPM or EFI (Windows 11) will stay in Scheduling. Ask a cluster admin to check the HyperConverged vmStateStorageClass setting.",
+  "the HyperConverged vmStateStorageClass setting": "the HyperConverged vmStateStorageClass setting"
 }

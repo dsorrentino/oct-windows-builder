@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { StorageClassKind } from '../k8s-resources';
-import { StorageProfileKind, evaluateVmStateStorage, quantityBytes } from '../vm-state-storage';
+import { StorageProfileKind, evaluateVmStateStorage, quantityBytes, vmStateStorageCommand } from '../vm-state-storage';
 
 const DEF = { 'storageclass.kubernetes.io/is-default-class': 'true' };
 const VIRT = { 'storageclass.kubevirt.io/is-default-virt-class': 'true' };
@@ -109,5 +109,13 @@ describe('quantityBytes', () => {
     expect(quantityBytes('1Gi')).toBe(1024 ** 3);
     expect(quantityBytes('500M')).toBe(500e6);
     expect(quantityBytes('junk')).toBe(0);
+  });
+});
+
+describe('vmStateStorageCommand', () => {
+  it('patches the v1beta1 field the plugin reads', () => {
+    const cmd = vmStateStorageCommand('openshift-cnv', 'kubevirt-hyperconverged', 'rbd');
+    expect(cmd).toContain('hyperconverged.v1beta1.hco.kubevirt.io');
+    expect(cmd).toContain('{"spec":{"vmStateStorageClass":"rbd"}}');
   });
 });
