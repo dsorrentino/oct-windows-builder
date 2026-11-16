@@ -2,7 +2,13 @@ import React, { FC, useMemo, useState } from 'react';
 import { k8sPatch, useAccessReview, useK8sWatchResource } from '@openshift-console/dynamic-plugin-sdk';
 import { useTranslation } from 'react-i18next';
 import { Alert, Button, ClipboardCopy, Flex, FlexItem } from '@patternfly/react-core';
-import { HyperConvergedKind, HyperConvergedModel, StorageClassKind, StorageProfileModel } from '../utils/k8s-resources';
+import {
+  HyperConvergedKind,
+  HyperConvergedModel,
+  StorageClassKind,
+  StorageProfileModel,
+  isMissingCrdError,
+} from '../utils/k8s-resources';
 import {
   MIN_PVC_SIZE_ANNOTATION,
   StorageProfileKind,
@@ -64,11 +70,12 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  if (!storageClassesLoaded || !spLoaded || !hcoLoaded) return null;
+  if (!storageClassesLoaded || !spLoaded) return null;
+  // Check the error before the loaded flag: a 403 reports loaded=false together with the error.
   // Can't read the HyperConverged resource: judge from the default classes the user can see,
   // with a softer note (an admin may have set another VM state class) and no buttons.
-  if (hcoErr || !hco?.metadata?.name) {
-    if (!hcoErr) return null; // no OpenShift Virtualization: nothing to check
+  if (hcoErr) {
+    if (isMissingCrdError(hcoErr)) return null; // no OpenShift Virtualization: nothing to check
     const guess = evaluateVmStateStorage(undefined, storageClasses, profiles || []);
     if (!guess.broken) return null;
     return (
@@ -77,7 +84,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  if (!result.broken) return null;
+  if (!hcoLoaded || !hco?.metadata?.name || !result.broken) return null;
 
   const sc = result.className;
   const fix = result.suggestion;
