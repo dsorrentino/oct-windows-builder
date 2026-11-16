@@ -36,8 +36,12 @@ export type VmStateStorage = {
   /** Other classes tied as default at the same level (KubeVirt may pick any of them). */
   tiedWith: string[];
   fsType: string;
-  /** VM state volumes can't be created: an XFS class without a minimum PVC size. */
+  /** VM state volumes can't be created: an XFS class without an effective minimum PVC size. */
   broken: boolean;
+  /** The class declares no filesystem and its driver's default is unknown (it may be XFS). */
+  undeclared: boolean;
+  /** The minimum-size annotation is set but CDI's PVC rendering gate is off, so it has no effect. */
+  annotationIneffective: boolean;
   /** A class that can hold tiny Filesystem volumes ('' when none). */
   suggestion: string;
 };
@@ -67,7 +71,20 @@ export function quantityBytes(q?: string): number {
 }
 
 /** XFS is fine when the class's StorageProfile makes CDI request at least 300Mi. */
-function xfsSafe(profile?: StorageProfileKind): boolean {
+/** CDI applies cdi.kubevirt.io/minimumSupportedPvcSize through its PVC rendering webhook. */
+export const PVC_RENDERING_GATE = 'WebhookPvcRendering';
+
+/**
+ * Whether the minimum-size annotation takes effect: true/false from CDI's feature gates,
+ * undefined when CDI can't be read (then assume it does, as on OpenShift Virtualization's default).
+ */
+export function pvcRenderingEnabled(cdiFeatureGates?: string[] | null): boolean | undefined {
+  if (!cdiFeatureGates) return undefined;
+  return cdiFeatureGates.includes(PVC_RENDERING_GATE);
+}
+
+function xfsSafe(profile: StorageProfileKind | undefined, rendering: boolean | undefined): boolean {
+  if (rendering === false) return false;
   return quantityBytes(profile?.metadata.annotations?.[MIN_PVC_SIZE_ANNOTATION]) >= quantityBytes(XFS_MIN_PVC_SIZE);
 }
 
@@ -108,6 +125,7 @@ export function evaluateVmStateStorage(
   hcoSetting: string | undefined,
   classes: StorageClassKind[],
   profiles: StorageProfileKind[] = [],
+  pvcRendering?: boolean,
 ): VmStateStorage {
   const setting = (hcoSetting || '').trim();
   let source: VmStateStorage['source'] = 'none';
@@ -126,22 +144,81 @@ export function evaluateVmStateStorage(
       candidates = def;
     }
   }
+  const profileOf = (name: string) => profiles.find((p) => p.metadata.name === name);
   const brokenOne = (name: string) => {
-    const sc = classes.find((c) => c.metadata.name === name);
-    return storageClassFsType(sc) === 'xfs' && !xfsSafe(profiles.find((p) => p.metadata.name === name));
+    const c = classes.find((x) => x.metadata.name === name);
+    return storageClassFsType(c) === 'xfs' && !xfsSafe(profileOf(name), pvcRendering);
   };
   // With several defaults KubeVirt may pick any of them: report the first broken one.
   const className = candidates.find(brokenOne) || candidates[0] || '';
   const sc = classes.find((c) => c.metadata.name === className);
   const broken = Boolean(className) && brokenOne(className);
+  const annotated = quantityBytes(profileOf(className)?.metadata.annotations?.[MIN_PVC_SIZE_ANNOTATION]) > 0;
+  const undeclared =
+    !broken && Boolean(sc) && !effectiveFs(sc as StorageClassKind) && !xfsSafe(profileOf(className), pvcRendering);
   return {
     className,
     source,
     tiedWith: candidates.filter((c) => c !== className),
     fsType: storageClassFsType(sc),
     broken,
-    suggestion: broken ? pickSuggestion(classes, profiles, className) : '',
+    undeclared,
+    annotationIneffective: annotated && pvcRendering === false,
+    suggestion: broken || undeclared ? pickSuggestion(classes, profiles, className) : '',
   };
+}
+
+/** XFS-only mount options that would break an ext4 mount. */
+const XFS_ONLY_MOUNT_OPTIONS = /^(nouuid|logbufs=|logbsize=|allocsize=|inode64|inode32|largeio|swalloc|attr2|noattr2|pquota|uquota|gquota|prjquota|grpquota|usrquota)/;
+
+/**
+ * A copy of a StorageClass that formats with ext4: same provisioner, parameters, reclaim
+ * policy, binding mode, expansion and topology; fstype set to ext4; XFS-only mount options
+ * dropped; never marked default.
+ */
+export function ext4Variant(sc: StorageClassKind): StorageClassKind & { apiVersion: string; kind: string } {
+  const parameters = { ...(sc.parameters || {}) };
+  for (const k of FSTYPE_KEYS) delete parameters[k];
+  parameters['csi.storage.k8s.io/fstype'] = 'ext4';
+  const base = sc.metadata.name.replace(/-(xfs|filesystem|fs)$/, '');
+  const out: StorageClassKind & { apiVersion: string; kind: string } = {
+    apiVersion: 'storage.k8s.io/v1',
+    kind: 'StorageClass',
+    metadata: {
+      name: `${base}-ext4`.slice(0, 253),
+      annotations: { description: `ext4 variant of ${sc.metadata.name} (for small Filesystem volumes such as VM state)` },
+    },
+    provisioner: sc.provisioner,
+    parameters,
+  };
+  if (sc.reclaimPolicy) out.reclaimPolicy = sc.reclaimPolicy;
+  if (sc.volumeBindingMode) out.volumeBindingMode = sc.volumeBindingMode;
+  if (sc.allowVolumeExpansion !== undefined) out.allowVolumeExpansion = sc.allowVolumeExpansion;
+  if (sc.allowedTopologies) out.allowedTopologies = sc.allowedTopologies;
+  const mounts = (sc.mountOptions || []).filter((o) => !XFS_ONLY_MOUNT_OPTIONS.test(o));
+  if (mounts.length) out.mountOptions = mounts;
+  return out;
+}
+
+/** Minimal YAML for the copy box (flat maps and lists of strings only). */
+export function storageClassYaml(sc: ReturnType<typeof ext4Variant>): string {
+  const q = (v: unknown) => JSON.stringify(v);
+  const lines = [`apiVersion: ${sc.apiVersion}`, `kind: ${sc.kind}`, 'metadata:', `  name: ${sc.metadata.name}`];
+  if (sc.metadata.annotations) {
+    lines.push('  annotations:');
+    Object.entries(sc.metadata.annotations).forEach(([k, v]) => lines.push(`    ${k}: ${q(v)}`));
+  }
+  lines.push(`provisioner: ${sc.provisioner}`, 'parameters:');
+  Object.entries(sc.parameters || {}).forEach(([k, v]) => lines.push(`  ${k}: ${q(v)}`));
+  if (sc.reclaimPolicy) lines.push(`reclaimPolicy: ${sc.reclaimPolicy}`);
+  if (sc.volumeBindingMode) lines.push(`volumeBindingMode: ${sc.volumeBindingMode}`);
+  if (sc.allowVolumeExpansion !== undefined) lines.push(`allowVolumeExpansion: ${sc.allowVolumeExpansion}`);
+  if (sc.mountOptions?.length) {
+    lines.push('mountOptions:');
+    sc.mountOptions.forEach((o) => lines.push(`  - ${q(o)}`));
+  }
+  if (sc.allowedTopologies) lines.push(`allowedTopologies: ${JSON.stringify(sc.allowedTopologies)}`);
+  return lines.join('\n');
 }
 
 export function vmStateStorageCommand(hcoNamespace: string, hcoName: string, className: string): string {

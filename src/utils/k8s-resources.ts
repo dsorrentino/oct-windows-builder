@@ -141,10 +141,30 @@ export type StorageClassKind = {
   metadata: {
     name: string;
     annotations?: Record<string, string>;
+    labels?: Record<string, string>;
   };
   provisioner?: string;
   parameters?: Record<string, string>;
+  reclaimPolicy?: string;
+  volumeBindingMode?: string;
+  allowVolumeExpansion?: boolean;
+  mountOptions?: string[];
+  allowedTopologies?: unknown[];
 };
+
+/** CDI (cdi.kubevirt.io/v1beta1, cluster-scoped); spec.config.featureGates lists enabled gates. */
+export const CDIModel: K8sModel = {
+  apiVersion: 'v1beta1',
+  apiGroup: 'cdi.kubevirt.io',
+  kind: 'CDI',
+  abbr: 'CDI',
+  label: 'CDI',
+  labelPlural: 'CDIs',
+  plural: 'cdis',
+  namespaced: false,
+};
+
+export type CDIKind = K8sResourceCommon & { spec?: { config?: { featureGates?: string[] } } };
 
 export type TemplateParameter = {
   name?: string;

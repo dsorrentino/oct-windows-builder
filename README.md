@@ -40,7 +40,10 @@ Windows 11 and other templates with a persistent TPM or EFI get a small (about 1
 The page resolves the class the same way (all tied defaults are checked) and warns when it formats with XFS (`csi.storage.k8s.io/fstype: xfs`) and its StorageProfile has no `cdi.kubevirt.io/minimumSupportedPvcSize` of at least 300Mi. It offers two fixes, each with its `oc` command and, if you're allowed to make the change, a button that applies it with your own console permissions:
 
 - **Store VM state on another class:** one that can bind a Filesystem volume and formats small volumes (ext4 first, then CephFS, then NFS; object-bucket and static local classes are never offered).
-- **Keep the XFS class:** annotate its StorageProfile with `cdi.kubevirt.io/minimumSupportedPvcSize: 300Mi`, so each VM state volume is created at 300Mi.
+- **Keep the XFS class:** annotate its StorageProfile with `cdi.kubevirt.io/minimumSupportedPvcSize: 300Mi`, so each VM state volume is created at 300Mi. This relies on CDI's `WebhookPvcRendering` feature gate (on by default in OpenShift Virtualization); when the gate is off the fix isn't offered and an existing annotation isn't counted.
+- **Create an ext4 variant of the class** (block-only clusters): the same provisioner, parameters, reclaim policy, binding mode and expansion, with `csi.storage.k8s.io/fstype: ext4` and XFS-only mount options dropped, never marked default. The card shows the YAML and, if you may create StorageClasses, a button; once CDI has created its StorageProfile, the new class is offered for VM state.
+
+A VM state class that declares no `fstype` (and isn't Ceph RBD, CephFS or NFS, whose defaults are known) gets an info note with the same fixes: its driver chooses the filesystem, which may be XFS.
 
 When you can't read the HyperConverged resource, the page judges from the default classes and shows a softer note without buttons. A VM that never booted and is already stuck needs its `persistent-state-for-<vm>-xxxxx` PVC deleted and a restart after the fix; don't do that on a used VM, the volume holds its TPM (BitLocker keys) and EFI variables.
 

@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import { StorageClassKind } from '../k8s-resources';
-import { StorageProfileKind, evaluateVmStateStorage, quantityBytes, vmStateStorageCommand } from '../vm-state-storage';
+import {
+  StorageProfileKind,
+  evaluateVmStateStorage,
+  ext4Variant,
+  pvcRenderingEnabled,
+  quantityBytes,
+  storageClassYaml,
+  vmStateStorageCommand,
+} from '../vm-state-storage';
 
 const DEF = { 'storageclass.kubernetes.io/is-default-class': 'true' };
 const VIRT = { 'storageclass.kubevirt.io/is-default-virt-class': 'true' };
@@ -117,5 +125,57 @@ describe('vmStateStorageCommand', () => {
     const cmd = vmStateStorageCommand('openshift-cnv', 'kubevirt-hyperconverged', 'rbd');
     expect(cmd).toContain('hyperconverged.v1beta1.hco.kubevirt.io');
     expect(cmd).toContain('{"spec":{"vmStateStorageClass":"rbd"}}');
+  });
+});
+
+describe('block-only clusters', () => {
+  const pureXfs = sc('pure-fs', 'pxd.portworx.com', 'xfs', DEF);
+  const annotated = fsProfile('pure-fs', { 'cdi.kubevirt.io/minimumSupportedPvcSize': '300Mi' });
+
+  it('reads the PVC rendering gate from CDI', () => {
+    expect(pvcRenderingEnabled(['HonorWaitForFirstConsumer', 'WebhookPvcRendering'])).toBe(true);
+    expect(pvcRenderingEnabled(['HonorWaitForFirstConsumer'])).toBe(false);
+    expect(pvcRenderingEnabled(undefined)).toBeUndefined();
+  });
+
+  it('counts the minimum-size annotation only while the gate is on (or CDI is unreadable)', () => {
+    expect(evaluateVmStateStorage('', [pureXfs], [annotated], true).broken).toBe(false);
+    expect(evaluateVmStateStorage('', [pureXfs], [annotated], undefined).broken).toBe(false);
+    const off = evaluateVmStateStorage('', [pureXfs], [annotated], false);
+    expect(off).toMatchObject({ broken: true, annotationIneffective: true });
+  });
+
+  it('flags a class that declares no filesystem as undeclared, not broken', () => {
+    const r = evaluateVmStateStorage('', [sc('pure', 'pxd.portworx.com', '', DEF)], [fsProfile('pure')]);
+    expect(r).toMatchObject({ className: 'pure', broken: false, undeclared: true });
+  });
+
+  it('does not call known driver defaults undeclared (Ceph RBD, CephFS, NFS)', () => {
+    for (const prov of ['openshift-storage.rbd.csi.ceph.com', 'openshift-storage.cephfs.csi.ceph.com', 'nfs.csi.k8s.io']) {
+      const r = evaluateVmStateStorage('', [sc('c', prov, '', DEF)], [fsProfile('c')]);
+      expect(r.undeclared).toBe(false);
+    }
+  });
+
+  it('builds an ext4 variant: same driver and settings, ext4, no XFS mount options, not default', () => {
+    const src: Parameters<typeof ext4Variant>[0] = {
+      metadata: { name: 'pure-filesystem', annotations: DEF },
+      provisioner: 'pxd.portworx.com',
+      parameters: { 'csi.storage.k8s.io/fstype': 'xfs', backend: 'pure_block' },
+      reclaimPolicy: 'Delete',
+      volumeBindingMode: 'WaitForFirstConsumer',
+      allowVolumeExpansion: true,
+      mountOptions: ['nouuid', 'discard'],
+    };
+    const v = ext4Variant(src);
+    expect(v.metadata.name).toBe('pure-ext4');
+    expect(v.metadata.annotations?.['storageclass.kubernetes.io/is-default-class']).toBeUndefined();
+    expect(v.parameters).toEqual({ 'csi.storage.k8s.io/fstype': 'ext4', backend: 'pure_block' });
+    expect(v.mountOptions).toEqual(['discard']);
+    expect(v).toMatchObject({ provisioner: 'pxd.portworx.com', reclaimPolicy: 'Delete', volumeBindingMode: 'WaitForFirstConsumer', allowVolumeExpansion: true });
+    const yaml = storageClassYaml(v);
+    expect(yaml).toContain('name: pure-ext4');
+    expect(yaml).toContain('csi.storage.k8s.io/fstype: "ext4"');
+    expect(yaml).not.toContain('nouuid');
   });
 });
