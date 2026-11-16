@@ -17,8 +17,11 @@ import {
   StorageProfileKind,
   XFS_MIN_PVC_SIZE,
   PVC_RENDERING_GATE,
+  claimsPatchCommand,
   evaluateVmStateStorage,
   ext4Variant,
+  filesystemClaims,
+  variantState,
   minPvcSizeCommand,
   pvcRenderingEnabled,
   storageClassYaml,
@@ -47,6 +50,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
   const [cdis, cdiLoaded, cdiErr] = useK8sWatchResource<CDIKind[]>({ groupVersionKind: CDI_GVK, isList: true, namespaced: false });
   const pvcRendering = cdiLoaded && !cdiErr && (cdis || [])[0] ? pvcRenderingEnabled((cdis || [])[0].spec?.config?.featureGates || []) : undefined;
   const [busy, setBusy] = useState('');
+  const [created, setCreated] = useState('');
   const [applyError, setApplyError] = useState('');
   const [applied, setApplied] = useState('');
 
@@ -64,6 +68,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
     name: hco?.metadata?.name,
   });
   const [canCreateClass] = useAccessReview({ group: StorageClassModel.apiGroup, resource: StorageClassModel.plural, verb: 'create' });
+  const [canPatchAnyProfile] = useAccessReview({ group: StorageProfileModel.apiGroup, resource: StorageProfileModel.plural, verb: 'patch' });
   const [canPatchProfile] = useAccessReview({
     group: StorageProfileModel.apiGroup,
     resource: StorageProfileModel.plural,
@@ -82,7 +87,8 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  if (!storageClassesLoaded || !spLoaded) return null;
+  // Wait for CDI too, so a gate-off cluster never flashes the minimum-size fix.
+  if (!storageClassesLoaded || !spLoaded || !(cdiLoaded || cdiErr)) return null;
   // Check the error before the loaded flag: a 403 reports loaded=false together with the error.
   // Can't read the HyperConverged resource: judge from the default classes the user can see,
   // with a softer note (an admin may have set another VM state class) and no buttons.
@@ -101,15 +107,47 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
   const sc = result.className;
   const fix = result.suggestion;
   const current = storageClasses.find((c) => c.metadata.name === sc);
-  const variant = current?.provisioner ? ext4Variant(current) : undefined;
-  const variantExists = Boolean(variant && storageClasses.some((c) => c.metadata.name === variant.metadata.name));
-  const run = async (what: 'hco' | 'profile' | 'variant') => {
+  const sourceProfile = (profiles || []).find((p) => p.metadata.name === sc);
+  let variant = current?.provisioner ? ext4Variant(current) : undefined;
+  let vstate = variant ? variantState(variant.metadata.name, current?.provisioner, storageClasses, profiles || []) : undefined;
+  if (current && variant && vstate?.kind === 'conflict') {
+    // The natural name is taken by something else: use a distinct one.
+    variant = ext4Variant(current, `${variant.metadata.name.replace(/-ext4$/, '')}-vmstate-ext4`.slice(-253));
+    vstate = variantState(variant.metadata.name, current.provisioner, storageClasses, profiles || []);
+  }
+  const claims = filesystemClaims(sourceProfile);
+  const patchClaims = async (name: string) => {
+    if (!claims.length) return;
+    // CDI creates the variant's StorageProfile within seconds; it has no claim properties for drivers it doesn't know.
+    const resource = { metadata: { name } };
+    for (let i = 0; i < 15; i++) {
+      for (const data of [
+        [{ op: 'add', path: '/spec/claimPropertySets', value: claims }],
+        [{ op: 'add', path: '/spec', value: { claimPropertySets: claims } }], // new profile without a spec object
+      ]) {
+        try {
+          await k8sPatch({ model: StorageProfileModel, resource, data });
+          return;
+        } catch {
+          /* not created yet, or no spec: try the other form, then wait */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  };
+  const run = async (what: 'hco' | 'profile' | 'variant' | 'claims') => {
     setBusy(what);
     setApplyError('');
     try {
       if (what === 'variant' && variant) {
         await k8sCreate({ model: StorageClassModel, data: variant });
-        // Stays on the card: the new class becomes the suggestion once CDI creates its StorageProfile.
+        setCreated(t('Created {{name}}.', { name: variant.metadata.name }));
+        // Copy the source class's Filesystem claim properties, so the variant can be offered for VM state.
+        if (canPatchAnyProfile) await patchClaims(variant.metadata.name);
+        return;
+      }
+      if (what === 'claims' && variant) {
+        await patchClaims(variant.metadata.name);
         return;
       }
       if (what === 'hco') {
@@ -193,7 +231,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
             </ClipboardCopy>
           </FlexItem>
         ) : null}
-        {variant && !variantExists ? (
+        {variant && vstate?.kind === 'missing' ? (
           <FlexItem>
             <strong>{t('Create {{name}}, an ext4 variant of {{sc}}', { name: variant.metadata.name, sc })}</strong>{' '}
             {t('(same driver and settings, formats with ext4; then use it for VM state). Useful when the cluster has only block storage.')}
@@ -210,8 +248,25 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
             </ClipboardCopy>
           </FlexItem>
         ) : null}
-        {variantExists && !fix ? (
-          <FlexItem>{t('{{name}} exists; it is offered for VM state once CDI has created its StorageProfile.', { name: variant?.metadata.name })}</FlexItem>
+        {variant && vstate?.kind === 'no-claims' ? (
+          <FlexItem>
+            {vstate.profileExists
+              ? t('{{name}} exists, but its StorageProfile lists no Filesystem claim properties (CDI does not know this driver), so it can\'t be offered for VM state yet. Add them:', { name: variant.metadata.name })
+              : t('{{name}} exists; waiting for CDI to create its StorageProfile.', { name: variant.metadata.name })}
+            {vstate.profileExists && canPatchAnyProfile && claims.length ? (
+              <>
+                {' '}
+                <Button variant="secondary" size="sm" onClick={() => run('claims')} isLoading={busy === 'claims'} isDisabled={Boolean(busy)}>
+                  {t('Copy the claim properties from {{sc}}', { sc })}
+                </Button>
+              </>
+            ) : null}
+            {vstate.profileExists ? (
+              <ClipboardCopy isReadOnly hoverTip={t('Copy')} clickTip={t('Copied')}>
+                {claimsPatchCommand(variant.metadata.name, claims)}
+              </ClipboardCopy>
+            ) : null}
+          </FlexItem>
         ) : null}
         {!gateOff ? (
           <FlexItem>
@@ -232,6 +287,7 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
         ) : null}
       </Flex>
       {!canPatchHco && !canPatchProfile && !canCreateClass ? <p>{t('Ask a cluster admin to apply one of these fixes.')}</p> : null}
+      {created ? <Alert variant="success" isInline isPlain title={created} /> : null}
       {applyError ? (
         <Alert variant="danger" isInline isPlain title={t('Could not apply the fix')}>
           {applyError}

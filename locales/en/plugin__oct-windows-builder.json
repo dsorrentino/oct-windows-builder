@@ -123,6 +123,9 @@
   "Create {{name}}, an ext4 variant of {{sc}}": "Create {{name}}, an ext4 variant of {{sc}}",
   "(same driver and settings, formats with ext4; then use it for VM state). Useful when the cluster has only block storage.": "(same driver and settings, formats with ext4; then use it for VM state). Useful when the cluster has only block storage.",
   "Create {{name}}": "Create {{name}}",
-  "{{name}} exists; it is offered for VM state once CDI has created its StorageProfile.": "{{name}} exists; it is offered for VM state once CDI has created its StorageProfile.",
-  "Ask a cluster admin to apply one of these fixes.": "Ask a cluster admin to apply one of these fixes."
+  "Ask a cluster admin to apply one of these fixes.": "Ask a cluster admin to apply one of these fixes.",
+  "Created {{name}}.": "Created {{name}}.",
+  "{{name}} exists, but its StorageProfile lists no Filesystem claim properties (CDI does not know this driver), so it can't be offered for VM state yet. Add them:": "{{name}} exists, but its StorageProfile lists no Filesystem claim properties (CDI does not know this driver), so it can't be offered for VM state yet. Add them:",
+  "{{name}} exists; waiting for CDI to create its StorageProfile.": "{{name}} exists; waiting for CDI to create its StorageProfile.",
+  "Copy the claim properties from {{sc}}": "Copy the claim properties from {{sc}}"
 }

@@ -95,20 +95,36 @@ function bindsFilesystem(profile?: StorageProfileKind): boolean {
   );
 }
 
+/**
+ * Drivers whose filesystem is known when the class sets no fstype. Each formats ext4 by
+ * default per its documentation (or passes an empty fstype to the Kubernetes mount library,
+ * which formats ext4); the hostpath provisioner doesn't format at all.
+ */
+const KNOWN_DEFAULTS: Array<[RegExp, string]> = [
+  [/cephfs\.csi\.ceph\.com/, 'cephfs'],
+  [/nfs/i, 'nfs'],
+  [/rbd\.csi\.ceph\.com/, 'ext4'], // ceph-csi RBD
+  [/^csi\.kubevirt\.io$/, 'ext4'], // KubeVirt CSI (nested clusters)
+  [/^ebs\.csi\.aws\.com$/, 'ext4'],
+  [/^pd\.csi\.storage\.gke\.io$/, 'ext4'],
+  [/^disk\.csi\.azure\.com$/, 'ext4'],
+  [/^csi\.vsphere\.vmware\.com$/, 'ext4'],
+  [/^cinder\.csi\.openstack\.org$/, 'ext4'],
+  [/^kubevirt\.io\.hostpath-provisioner$/, 'hostpath'],
+];
+
 /** Filesystem the class formats with, including drivers whose default is known. */
 function effectiveFs(sc: StorageClassKind): string {
   const fs = storageClassFsType(sc);
   if (fs) return fs;
   const prov = sc.provisioner || '';
-  if (/cephfs\.csi\.ceph\.com/.test(prov)) return 'cephfs';
-  if (/nfs/i.test(prov)) return 'nfs';
-  if (/rbd\.csi\.ceph\.com/.test(prov)) return 'ext4'; // ceph-csi RBD default
-  return '';
+  const hit = KNOWN_DEFAULTS.find(([re]) => re.test(prov));
+  return hit ? hit[1] : '';
 }
 
 function pickSuggestion(classes: StorageClassKind[], profiles: StorageProfileKind[], current: string): string {
   const profileOf = (name: string) => profiles.find((p) => p.metadata.name === name);
-  const fsScore: Record<string, number> = { ext4: 3, cephfs: 2, nfs: 1 };
+  const fsScore: Record<string, number> = { ext4: 3, cephfs: 2, nfs: 1, hostpath: 1 };
   const ranked = classes
     .filter((sc) => sc.metadata.name !== current && bindsFilesystem(profileOf(sc.metadata.name)))
     .map((sc) => {
@@ -168,6 +184,45 @@ export function evaluateVmStateStorage(
   };
 }
 
+/** In-tree provisioners are kubernetes.io/<name>; everything else is a CSI driver. */
+function isCsiDriver(provisioner?: string): boolean {
+  return Boolean(provisioner) && !provisioner!.startsWith('kubernetes.io/');
+}
+
+export type VariantState =
+  /** No class with that name yet. */
+  | { kind: 'missing' }
+  /** The class exists and is an ext4 variant of the same driver, but its StorageProfile has no Filesystem claim yet. */
+  | { kind: 'no-claims'; profileExists: boolean }
+  /** Ready: it can be offered for VM state. */
+  | { kind: 'ready' }
+  /** A class with that name exists but isn't an ext4 class of the same driver. */
+  | { kind: 'conflict' };
+
+export function variantState(
+  variantName: string,
+  provisioner: string | undefined,
+  classes: StorageClassKind[],
+  profiles: StorageProfileKind[],
+): VariantState {
+  const existing = classes.find((c) => c.metadata.name === variantName);
+  if (!existing) return { kind: 'missing' };
+  if (existing.provisioner !== provisioner || effectiveFs(existing) !== 'ext4') return { kind: 'conflict' };
+  const profile = profiles.find((p) => p.metadata.name === variantName);
+  if (!bindsFilesystem(profile)) return { kind: 'no-claims', profileExists: Boolean(profile) };
+  return { kind: 'ready' };
+}
+
+/** Filesystem claim property sets of a profile (status, as CDI computed them), to copy onto the variant's profile. */
+export function filesystemClaims(profile?: StorageProfileKind): Array<{ accessModes?: string[]; volumeMode?: string }> {
+  return (profile?.status?.claimPropertySets || []).filter((p) => (p.volumeMode || 'Filesystem') === 'Filesystem' && (p.accessModes || []).length);
+}
+
+export function claimsPatchCommand(profileName: string, claims: Array<{ accessModes?: string[]; volumeMode?: string }>): string {
+  const sets = claims.length ? claims : [{ accessModes: ['ReadWriteOnce'], volumeMode: 'Filesystem' }];
+  return `oc patch storageprofile ${profileName} --type merge -p '${JSON.stringify({ spec: { claimPropertySets: sets } })}'`;
+}
+
 /** XFS-only mount options that would break an ext4 mount. */
 const XFS_ONLY_MOUNT_OPTIONS = /^(nouuid|logbufs=|logbsize=|allocsize=|inode64|inode32|largeio|swalloc|attr2|noattr2|pquota|uquota|gquota|prjquota|grpquota|usrquota)/;
 
@@ -176,16 +231,19 @@ const XFS_ONLY_MOUNT_OPTIONS = /^(nouuid|logbufs=|logbsize=|allocsize=|inode64|i
  * policy, binding mode, expansion and topology; fstype set to ext4; XFS-only mount options
  * dropped; never marked default.
  */
-export function ext4Variant(sc: StorageClassKind): StorageClassKind & { apiVersion: string; kind: string } {
+export function ext4Variant(sc: StorageClassKind, nameOverride?: string): StorageClassKind & { apiVersion: string; kind: string } {
+  // Write ext4 under the key the source class uses: drivers that format at CreateVolume read
+  // their own parameter (Portworx fs, in-tree fsType) and may ignore the CSI key.
   const parameters = { ...(sc.parameters || {}) };
-  for (const k of FSTYPE_KEYS) delete parameters[k];
-  parameters['csi.storage.k8s.io/fstype'] = 'ext4';
-  const base = sc.metadata.name.replace(/-(xfs|filesystem|fs)$/, '');
+  const keys = FSTYPE_KEYS.filter((k) => k in parameters);
+  keys.forEach((k) => (parameters[k] = 'ext4'));
+  if (!keys.length) parameters[isCsiDriver(sc.provisioner) ? 'csi.storage.k8s.io/fstype' : 'fsType'] = 'ext4';
+  const base = sc.metadata.name.replace(/-(xfs|filesystem|fs)$/, '').slice(0, 253 - '-ext4'.length);
   const out: StorageClassKind & { apiVersion: string; kind: string } = {
     apiVersion: 'storage.k8s.io/v1',
     kind: 'StorageClass',
     metadata: {
-      name: `${base}-ext4`.slice(0, 253),
+      name: nameOverride || `${base}-ext4`,
       annotations: { description: `ext4 variant of ${sc.metadata.name} (for small Filesystem volumes such as VM state)` },
     },
     provisioner: sc.provisioner,

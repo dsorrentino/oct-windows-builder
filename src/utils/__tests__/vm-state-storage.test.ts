@@ -3,8 +3,11 @@ import { StorageClassKind } from '../k8s-resources';
 import {
   StorageProfileKind,
   evaluateVmStateStorage,
+  claimsPatchCommand,
   ext4Variant,
+  filesystemClaims,
   pvcRenderingEnabled,
+  variantState,
   quantityBytes,
   storageClassYaml,
   vmStateStorageCommand,
@@ -177,5 +180,57 @@ describe('block-only clusters', () => {
     expect(yaml).toContain('name: pure-ext4');
     expect(yaml).toContain('csi.storage.k8s.io/fstype: "ext4"');
     expect(yaml).not.toContain('nouuid');
+  });
+});
+
+describe('review follow-ups (#3)', () => {
+  it('knows drivers that format ext4 by default, so a no-fstype class is not "undeclared"', () => {
+    for (const prov of ['csi.kubevirt.io', 'ebs.csi.aws.com', 'pd.csi.storage.gke.io', 'disk.csi.azure.com', 'csi.vsphere.vmware.com', 'cinder.csi.openstack.org', 'kubevirt.io.hostpath-provisioner']) {
+      expect(evaluateVmStateStorage('', [sc('c', prov, '', DEF)], [fsProfile('c')]).undeclared).toBe(false);
+    }
+  });
+
+  it('stays quiet for an XFS default plus a no-fstype KubeVirt CSI default-virt class', () => {
+    const classes = [sc('xfs', 'x.csi', 'xfs', DEF), sc('kv', 'csi.kubevirt.io', '', VIRT)];
+    expect(evaluateVmStateStorage('', classes, [fsProfile('xfs'), fsProfile('kv')])).toMatchObject({ broken: false, undeclared: false });
+  });
+
+  it('writes ext4 under the fstype key the source class used', () => {
+    const fs = ext4Variant({ metadata: { name: 'px' }, provisioner: 'pxd.portworx.com', parameters: { fs: 'xfs', repl: '2' } });
+    expect(fs.parameters).toEqual({ fs: 'ext4', repl: '2' });
+    const intree = ext4Variant({ metadata: { name: 'old' }, provisioner: 'kubernetes.io/cinder', parameters: { fsType: 'xfs' } });
+    expect(intree.parameters).toEqual({ fsType: 'ext4' });
+    const csiNone = ext4Variant({ metadata: { name: 'n' }, provisioner: 'some.csi.example', parameters: {} });
+    expect(csiNone.parameters).toEqual({ 'csi.storage.k8s.io/fstype': 'ext4' });
+    const intreeNone = ext4Variant({ metadata: { name: 'n' }, provisioner: 'kubernetes.io/vsphere-volume', parameters: {} });
+    expect(intreeNone.parameters).toEqual({ fsType: 'ext4' });
+  });
+
+  it('copies topology and keeps the -ext4 suffix on very long names', () => {
+    const topo = [{ matchLabelExpressions: [{ key: 'zone', values: ['a'] }] }];
+    const v = ext4Variant({ metadata: { name: 'x'.repeat(260) }, provisioner: 'd.csi', parameters: { 'csi.storage.k8s.io/fstype': 'xfs' }, allowedTopologies: topo });
+    expect(v.allowedTopologies).toEqual(topo);
+    expect(v.metadata.name.endsWith('-ext4')).toBe(true);
+    expect(v.metadata.name.length).toBeLessThanOrEqual(253);
+  });
+
+  it('tracks the variant: missing, no claim properties, ready, conflict', () => {
+    const v = sc('pure-ext4', 'pxd.portworx.com', 'ext4');
+    const noClaims: StorageProfileKind = { metadata: { name: 'pure-ext4' }, status: {} };
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [], [])).toEqual({ kind: 'missing' });
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [v], [])).toEqual({ kind: 'no-claims', profileExists: false });
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [v], [noClaims])).toEqual({ kind: 'no-claims', profileExists: true });
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [v], [fsProfile('pure-ext4')])).toEqual({ kind: 'ready' });
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [sc('pure-ext4', 'other.csi', 'ext4')], [])).toEqual({ kind: 'conflict' });
+    expect(variantState('pure-ext4', 'pxd.portworx.com', [sc('pure-ext4', 'pxd.portworx.com', 'xfs')], [])).toEqual({ kind: 'conflict' });
+  });
+
+  it('copies only Filesystem claim properties and builds the patch command', () => {
+    const prof: StorageProfileKind = { metadata: { name: 'src' }, status: { claimPropertySets: [
+      { accessModes: ['ReadWriteMany'], volumeMode: 'Block' },
+      { accessModes: ['ReadWriteOnce'], volumeMode: 'Filesystem' },
+    ] } };
+    expect(filesystemClaims(prof)).toEqual([{ accessModes: ['ReadWriteOnce'], volumeMode: 'Filesystem' }]);
+    expect(claimsPatchCommand('v', [])).toContain('"claimPropertySets":[{"accessModes":["ReadWriteOnce"],"volumeMode":"Filesystem"}]');
   });
 });
