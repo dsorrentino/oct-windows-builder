@@ -1,11 +1,14 @@
 import React, { FC, useMemo, useState } from 'react';
-import { k8sPatch, useAccessReview, useK8sWatchResource } from '@openshift-console/dynamic-plugin-sdk';
+import { k8sCreate, k8sPatch, useAccessReview, useK8sWatchResource } from '@openshift-console/dynamic-plugin-sdk';
 import { useTranslation } from 'react-i18next';
 import { Alert, Button, ClipboardCopy, Flex, FlexItem } from '@patternfly/react-core';
 import {
+  CDIKind,
+  CDIModel,
   HyperConvergedKind,
   HyperConvergedModel,
   StorageClassKind,
+  StorageClassModel,
   StorageProfileModel,
   isMissingCrdError,
 } from '../utils/k8s-resources';
@@ -13,13 +16,21 @@ import {
   MIN_PVC_SIZE_ANNOTATION,
   StorageProfileKind,
   XFS_MIN_PVC_SIZE,
+  PVC_RENDERING_GATE,
+  claimsPatchCommand,
   evaluateVmStateStorage,
+  ext4Variant,
+  filesystemClaims,
+  variantState,
   minPvcSizeCommand,
+  pvcRenderingEnabled,
+  storageClassYaml,
   vmStateStorageCommand,
 } from '../utils/vm-state-storage';
 
 const HCO_GVK = { group: HyperConvergedModel.apiGroup, version: HyperConvergedModel.apiVersion, kind: HyperConvergedModel.kind };
 const SP_GVK = { group: StorageProfileModel.apiGroup, version: StorageProfileModel.apiVersion, kind: StorageProfileModel.kind };
+const CDI_GVK = { group: CDIModel.apiGroup, version: CDIModel.apiVersion, kind: CDIModel.kind };
 
 type Props = {
   storageClasses: StorageClassKind[];
@@ -35,15 +46,19 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
   const { t } = useTranslation('plugin__oct-windows-builder');
   const [hcos, hcoLoaded, hcoErr] = useK8sWatchResource<HyperConvergedKind[]>({ groupVersionKind: HCO_GVK, isList: true, namespaced: false });
   const [profiles, spLoaded] = useK8sWatchResource<StorageProfileKind[]>({ groupVersionKind: SP_GVK, isList: true, namespaced: false });
+  // CDI's feature gates decide whether the StorageProfile minimum size takes effect (unreadable: assume it does).
+  const [cdis, cdiLoaded, cdiErr] = useK8sWatchResource<CDIKind[]>({ groupVersionKind: CDI_GVK, isList: true, namespaced: false });
+  const pvcRendering = cdiLoaded && !cdiErr && (cdis || [])[0] ? pvcRenderingEnabled((cdis || [])[0].spec?.config?.featureGates || []) : undefined;
   const [busy, setBusy] = useState('');
+  const [created, setCreated] = useState('');
   const [applyError, setApplyError] = useState('');
   const [applied, setApplied] = useState('');
 
   const hco = (hcos || [])[0];
   const ns = hco?.metadata?.namespace || 'openshift-cnv';
   const result = useMemo(
-    () => evaluateVmStateStorage(hco?.spec?.vmStateStorageClass, storageClasses, profiles || []),
-    [hco, storageClasses, profiles],
+    () => evaluateVmStateStorage(hco?.spec?.vmStateStorageClass, storageClasses, profiles || [], pvcRendering),
+    [hco, storageClasses, profiles, pvcRendering],
   );
   const [canPatchHco] = useAccessReview({
     group: HyperConvergedModel.apiGroup,
@@ -52,6 +67,8 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
     namespace: ns,
     name: hco?.metadata?.name,
   });
+  const [canCreateClass] = useAccessReview({ group: StorageClassModel.apiGroup, resource: StorageClassModel.plural, verb: 'create' });
+  const [canPatchAnyProfile] = useAccessReview({ group: StorageProfileModel.apiGroup, resource: StorageProfileModel.plural, verb: 'patch' });
   const [canPatchProfile] = useAccessReview({
     group: StorageProfileModel.apiGroup,
     resource: StorageProfileModel.plural,
@@ -70,13 +87,14 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  if (!storageClassesLoaded || !spLoaded) return null;
+  // Wait for CDI too, so a gate-off cluster never flashes the minimum-size fix.
+  if (!storageClassesLoaded || !spLoaded || !(cdiLoaded || cdiErr)) return null;
   // Check the error before the loaded flag: a 403 reports loaded=false together with the error.
   // Can't read the HyperConverged resource: judge from the default classes the user can see,
   // with a softer note (an admin may have set another VM state class) and no buttons.
   if (hcoErr) {
     if (isMissingCrdError(hcoErr)) return null; // no OpenShift Virtualization: nothing to check
-    const guess = evaluateVmStateStorage(undefined, storageClasses, profiles || []);
+    const guess = evaluateVmStateStorage(undefined, storageClasses, profiles || [], pvcRendering);
     if (!guess.broken) return null;
     return (
       <Alert variant="info" isInline title={t('Windows 11 VMs may not start: the default VM state class {{sc}} uses XFS', { sc: guess.className })}>
@@ -84,14 +102,54 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
       </Alert>
     );
   }
-  if (!hcoLoaded || !hco?.metadata?.name || !result.broken) return null;
+  if (!hcoLoaded || !hco?.metadata?.name || !(result.broken || result.undeclared)) return null;
 
   const sc = result.className;
   const fix = result.suggestion;
-  const run = async (what: 'hco' | 'profile') => {
+  const current = storageClasses.find((c) => c.metadata.name === sc);
+  const sourceProfile = (profiles || []).find((p) => p.metadata.name === sc);
+  let variant = current?.provisioner ? ext4Variant(current) : undefined;
+  let vstate = variant ? variantState(variant.metadata.name, current?.provisioner, storageClasses, profiles || []) : undefined;
+  if (current && variant && vstate?.kind === 'conflict') {
+    // The natural name is taken by something else: use a distinct one.
+    variant = ext4Variant(current, `${variant.metadata.name.replace(/-ext4$/, '')}-vmstate-ext4`.slice(-253));
+    vstate = variantState(variant.metadata.name, current.provisioner, storageClasses, profiles || []);
+  }
+  const claims = filesystemClaims(sourceProfile);
+  const patchClaims = async (name: string) => {
+    if (!claims.length) return;
+    // CDI creates the variant's StorageProfile within seconds; it has no claim properties for drivers it doesn't know.
+    const resource = { metadata: { name } };
+    for (let i = 0; i < 15; i++) {
+      for (const data of [
+        [{ op: 'add', path: '/spec/claimPropertySets', value: claims }],
+        [{ op: 'add', path: '/spec', value: { claimPropertySets: claims } }], // new profile without a spec object
+      ]) {
+        try {
+          await k8sPatch({ model: StorageProfileModel, resource, data });
+          return;
+        } catch {
+          /* not created yet, or no spec: try the other form, then wait */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+  };
+  const run = async (what: 'hco' | 'profile' | 'variant' | 'claims') => {
     setBusy(what);
     setApplyError('');
     try {
+      if (what === 'variant' && variant) {
+        await k8sCreate({ model: StorageClassModel, data: variant });
+        setCreated(t('Created {{name}}.', { name: variant.metadata.name }));
+        // Copy the source class's Filesystem claim properties, so the variant can be offered for VM state.
+        if (canPatchAnyProfile) await patchClaims(variant.metadata.name);
+        return;
+      }
+      if (what === 'claims' && variant) {
+        await patchClaims(variant.metadata.name);
+        return;
+      }
       if (what === 'hco') {
         await k8sPatch({
           model: HyperConvergedModel,
@@ -127,16 +185,34 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
         ? t('the default virtualization StorageClass')
         : t('the default StorageClass');
 
+  const gateOff = pvcRendering === false;
   return (
-    <Alert variant="warning" isInline title={t('Windows 11 VMs will not start: VM state storage uses XFS ({{sc}})', { sc })}>
+    <Alert
+      variant={result.broken ? 'warning' : 'info'}
+      isInline
+      title={
+        result.broken
+          ? t('Windows 11 VMs will not start: VM state storage uses XFS ({{sc}})', { sc })
+          : t('Windows 11 VMs may not start: VM state class {{sc}} does not declare a filesystem', { sc })
+      }
+    >
       <p>
         {t('OpenShift Virtualization stores each VM\'s TPM and EFI state on {{sc}} ({{where}}).', { sc, where })}{' '}
-        {t('That volume is about 10 MiB and XFS cannot be formatted that small, so Windows 11 and other templates with a persistent TPM or EFI stay in Scheduling.')}
+        {result.broken
+          ? t('That volume is about 10 MiB and XFS cannot be formatted that small, so Windows 11 and other templates with a persistent TPM or EFI stay in Scheduling.')
+          : t('The class sets no fstype, so its driver chooses one. If it is XFS, the 10 MiB volume cannot be formatted and Windows 11 VMs stay in Scheduling. If they do, apply one of these fixes.')}
       </p>
       {result.tiedWith.length ? (
         <p>{t('Several StorageClasses are marked default ({{others}}); KubeVirt may use any of them.', { others: [sc, ...result.tiedWith].join(', ') })}</p>
       ) : null}
-      <p>{t('Either fix works; both change cluster-wide settings:')}</p>
+      {gateOff ? (
+        <p>
+          {result.annotationIneffective
+            ? t('{{sc}} has a minimum PVC size, but CDI\'s {{gate}} feature gate is off, so it has no effect.', { sc, gate: PVC_RENDERING_GATE })
+            : t('The minimum-size fix is not offered: CDI\'s {{gate}} feature gate is off.', { gate: PVC_RENDERING_GATE })}
+        </p>
+      ) : null}
+      <p>{t('Each fix changes cluster-wide settings:')}</p>
       <Flex direction={{ default: 'column' }} spaceItems={{ default: 'spaceItemsSm' }}>
         {fix ? (
           <FlexItem>
@@ -155,23 +231,63 @@ const VmStateStorageCheck: FC<Props> = ({ storageClasses, storageClassesLoaded }
             </ClipboardCopy>
           </FlexItem>
         ) : null}
-        <FlexItem>
-          <strong>{t('Keep {{sc}} and give its volumes a minimum size of {{size}}', { sc, size: XFS_MIN_PVC_SIZE })}</strong>{' '}
-          {t('(StorageProfile annotation; each VM state volume then uses {{size}})', { size: XFS_MIN_PVC_SIZE })}
-          {canPatchProfile ? (
-            <>
-              {' '}
-              <Button variant="secondary" size="sm" onClick={() => run('profile')} isLoading={busy === 'profile'} isDisabled={Boolean(busy)}>
-                {t('Set the minimum size')}
-              </Button>
-            </>
-          ) : null}
-          <ClipboardCopy isReadOnly hoverTip={t('Copy')} clickTip={t('Copied')}>
-            {minPvcSizeCommand(sc)}
-          </ClipboardCopy>
-        </FlexItem>
+        {variant && vstate?.kind === 'missing' ? (
+          <FlexItem>
+            <strong>{t('Create {{name}}, an ext4 variant of {{sc}}', { name: variant.metadata.name, sc })}</strong>{' '}
+            {t('(same driver and settings, formats with ext4; then use it for VM state). Useful when the cluster has only block storage.')}
+            {canCreateClass ? (
+              <>
+                {' '}
+                <Button variant="secondary" size="sm" onClick={() => run('variant')} isLoading={busy === 'variant'} isDisabled={Boolean(busy)}>
+                  {t('Create {{name}}', { name: variant.metadata.name })}
+                </Button>
+              </>
+            ) : null}
+            <ClipboardCopy isReadOnly isCode isExpanded hoverTip={t('Copy')} clickTip={t('Copied')} variant="expansion">
+              {storageClassYaml(variant)}
+            </ClipboardCopy>
+          </FlexItem>
+        ) : null}
+        {variant && vstate?.kind === 'no-claims' ? (
+          <FlexItem>
+            {vstate.profileExists
+              ? t('{{name}} exists, but its StorageProfile lists no Filesystem claim properties (CDI does not know this driver), so it can\'t be offered for VM state yet. Add them:', { name: variant.metadata.name })
+              : t('{{name}} exists; waiting for CDI to create its StorageProfile.', { name: variant.metadata.name })}
+            {vstate.profileExists && canPatchAnyProfile && claims.length ? (
+              <>
+                {' '}
+                <Button variant="secondary" size="sm" onClick={() => run('claims')} isLoading={busy === 'claims'} isDisabled={Boolean(busy)}>
+                  {t('Copy the claim properties from {{sc}}', { sc })}
+                </Button>
+              </>
+            ) : null}
+            {vstate.profileExists ? (
+              <ClipboardCopy isReadOnly hoverTip={t('Copy')} clickTip={t('Copied')}>
+                {claimsPatchCommand(variant.metadata.name, claims)}
+              </ClipboardCopy>
+            ) : null}
+          </FlexItem>
+        ) : null}
+        {!gateOff ? (
+          <FlexItem>
+            <strong>{t('Keep {{sc}} and give its volumes a minimum size of {{size}}', { sc, size: XFS_MIN_PVC_SIZE })}</strong>{' '}
+            {t('(StorageProfile annotation; each VM state volume then uses {{size}})', { size: XFS_MIN_PVC_SIZE })}
+            {canPatchProfile ? (
+              <>
+                {' '}
+                <Button variant="secondary" size="sm" onClick={() => run('profile')} isLoading={busy === 'profile'} isDisabled={Boolean(busy)}>
+                  {t('Set the minimum size')}
+                </Button>
+              </>
+            ) : null}
+            <ClipboardCopy isReadOnly hoverTip={t('Copy')} clickTip={t('Copied')}>
+              {minPvcSizeCommand(sc)}
+            </ClipboardCopy>
+          </FlexItem>
+        ) : null}
       </Flex>
-      {!canPatchHco && !canPatchProfile ? <p>{t('Ask a cluster admin to run one of these commands.')}</p> : null}
+      {!canPatchHco && !canPatchProfile && !canCreateClass ? <p>{t('Ask a cluster admin to apply one of these fixes.')}</p> : null}
+      {created ? <Alert variant="success" isInline isPlain title={created} /> : null}
       {applyError ? (
         <Alert variant="danger" isInline isPlain title={t('Could not apply the fix')}>
           {applyError}
