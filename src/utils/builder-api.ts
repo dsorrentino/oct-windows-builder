@@ -1,5 +1,16 @@
 export const BUILDER_PROXY = '/api/proxy/plugin/oct-windows-builder/windows-builder';
 
+/**
+ * Headers for state-changing requests through the console proxy. With
+ * `authorization: UserToken` on the ConsolePlugin proxy the console checks the CSRF token
+ * (cookie `csrf-token`, header `X-CSRFToken`) like it does for its own API calls; a plain
+ * fetch without it gets 403 "invalid CSRFToken".
+ */
+export function csrfHeaders(): Record<string, string> {
+  const m = /(?:^|;\s*)csrf-token=([^;]+)/.exec(typeof document !== 'undefined' ? document.cookie : '');
+  return m ? { 'X-CSRFToken': decodeURIComponent(m[1]) } : {};
+}
+
 export type BuildUiStatus = 'Pending' | 'Installing' | 'Sysprep' | 'Ready' | 'Error' | 'Cancelled';
 
 /** Builds the builder is still working on (can be cancelled). */
@@ -84,7 +95,7 @@ export async function startBuild(req: StartBuildRequest): Promise<BuildRecord> {
   const res = requireResponse(
     await fetch(`${BUILDER_PROXY}/api/v1/builds`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
       body: JSON.stringify(req),
     }),
     'POST /api/v1/builds',
@@ -98,7 +109,7 @@ export async function startBuild(req: StartBuildRequest): Promise<BuildRecord> {
 /** Stops a running build; the builder removes its install VM and unfinished disks. */
 export async function cancelBuild(diskName: string): Promise<BuildRecord> {
   const path = `/api/v1/builds/${encodeURIComponent(diskName)}/cancel`;
-  const res = requireResponse(await fetch(`${BUILDER_PROXY}${path}`, { method: 'POST' }), `POST ${path}`);
+  const res = requireResponse(await fetch(`${BUILDER_PROXY}${path}`, { method: 'POST', headers: csrfHeaders() }), `POST ${path}`);
   if (!res.ok) {
     throw new Error(await readError(res));
   }
